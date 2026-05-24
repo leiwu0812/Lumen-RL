@@ -73,7 +73,21 @@ class CheckpointCallback(Callback):
     def on_step_end(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         if step % self.save_interval != 0:
             return
+        self._save(trainer, step, metrics)
 
+    def on_train_end(self, trainer: "RLTrainer") -> None:
+        """Always save the final trained weights, even when the last step
+        isn't a multiple of save_interval.  Without this, a run that ends at
+        step N where N % save_interval != 0 would drop the trained weights
+        and keep only an earlier snapshot.
+        """
+        step = int(getattr(trainer, "global_step", 0))
+        if step % self.save_interval == 0:
+            return  # on_step_end already saved this exact step
+        metrics = getattr(trainer, "last_metrics", {}) or {}
+        self._save(trainer, step, metrics)
+
+    def _save(self, trainer: "RLTrainer", step: int, metrics: dict[str, float]) -> None:
         rank = trainer._rank
         ckpt_dir = Path(self.checkpoint_dir)
         ckpt_dir.mkdir(parents=True, exist_ok=True)

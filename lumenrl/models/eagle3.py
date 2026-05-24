@@ -1,13 +1,19 @@
 """Eagle3 draft model for speculative decoding.
 
-Architecture aligned with lightseekorg/kimi-k2.5-eagle3 (HuggingFace format):
+Supports multiple HF Eagle3 checkpoint variants:
+- lightseekorg/kimi-k2.5-eagle3       — YaRN RoPE, dual-norm decoder
+- nvidia/gpt-oss-120b-Eagle3-long-context — Llama3 RoPE, eagle_config toggles
+
+Shared architecture:
 - RMSNorm (no bias) instead of LayerNorm
-- 3-input fusion: fc(cat(aux_layer_1, aux_layer_mid, aux_layer_late)) from teacher
+- 3-input fusion: fc(cat(aux_layer_*, ...)) from teacher
 - Dual-norm decoder: hidden_norm + input_layernorm, cat → attention
 - Separate Q/K/V projections with 2×hidden input dimension
-- YaRN RoPE scaling (rope_theta=1000000, factor=64)
 
-Architecture aligned with lightseekorg/kimi-k2.5-eagle3 (HuggingFace format).
+Version-specific knobs are exposed through Eagle3Model.__init__ kwargs and
+defaulted to the kimi-k2.5 behavior, so existing call sites are unaffected.
+Use Eagle3Model.from_hf_config(config_dict) to instantiate from any
+HF-style config.json directly.
 """
 
 from __future__ import annotations
@@ -81,6 +87,9 @@ class RotaryEmbedding(nn.Module):
         beta_slow: float = 1.0,
         mscale: float = 1.0,
         mscale_all_dim: float = 0.0,
+        rope_type: str = "yarn",
+        low_freq_factor: float = 1.0,
+        high_freq_factor: float = 4.0,
     ) -> None:
         super().__init__()
         self.dim = dim
@@ -92,23 +101,48 @@ class RotaryEmbedding(nn.Module):
         self.beta_slow = beta_slow
         self.mscale = mscale
         self.mscale_all_dim = mscale_all_dim
+        self.rope_type = rope_type
+        self.low_freq_factor = low_freq_factor
+        self.high_freq_factor = high_freq_factor
 
         self._cos_cached: Optional[Tensor] = None
         self._sin_cached: Optional[Tensor] = None
         self._cached_seq_len = 0
 
+    def _base_inv_freq(self, device: torch.device) -> Tensor:
+        return 1.0 / (
+            self.base ** (
+                torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim
+            )
+        )
+
     def _build_inv_freq(self, device: torch.device) -> Tensor:
         if self.scaling_factor <= 1.0:
-            inv_freq = 1.0 / (self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim))
-            return inv_freq
+            return self._base_inv_freq(device)
 
-        freq_extra = 1.0 / (
-            self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
-        )
-        freq_inter = 1.0 / (
-            self.scaling_factor
-            * self.base ** (torch.arange(0, self.dim, 2, device=device, dtype=torch.float32) / self.dim)
-        )
+        if self.rope_type == "llama3":
+            # HF transformers llama3 rope scaling:
+            #   smooth between low/high frequency wavelengths, scale the
+            #   low-frequency band by 1/factor, keep the high-frequency band as is.
+            inv_freq = self._base_inv_freq(device)
+            old_ctx = float(self.original_max_position_embeddings)
+            low_wl = old_ctx / self.low_freq_factor
+            high_wl = old_ctx / self.high_freq_factor
+            wavelen = 2 * math.pi / inv_freq
+
+            inv_freq_llama = torch.where(
+                wavelen > low_wl, inv_freq / self.scaling_factor, inv_freq
+            )
+            smooth = (old_ctx / wavelen - self.low_freq_factor) / (
+                self.high_freq_factor - self.low_freq_factor
+            )
+            smoothed = (1 - smooth) * inv_freq_llama / self.scaling_factor + smooth * inv_freq_llama
+            in_smooth_band = (wavelen >= high_wl) & (wavelen <= low_wl)
+            return torch.where(in_smooth_band, smoothed, inv_freq_llama)
+
+        # default: YaRN (original kimi-k2.5 behavior)
+        freq_extra = self._base_inv_freq(device)
+        freq_inter = freq_extra / self.scaling_factor
 
         low, high = _yarn_find_correction_range(
             self.beta_fast, self.beta_slow, self.dim, self.base,
@@ -120,6 +154,9 @@ class RotaryEmbedding(nn.Module):
 
     def _compute_mscale(self) -> float:
         if self.scaling_factor <= 1.0:
+            return 1.0
+        if self.rope_type == "llama3":
+            # Llama3 rope does not use YaRN-style softmax mscale.
             return 1.0
         return _yarn_get_mscale(self.scaling_factor, self.mscale) / _yarn_get_mscale(
             self.scaling_factor, self.mscale_all_dim
@@ -174,6 +211,7 @@ class Eagle3Attention(nn.Module):
         rope_theta: float = 1000000.0,
         max_position_embeddings: int = 262144,
         rope_scaling: Optional[dict] = None,
+        attention_bias: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_size = hidden_size
@@ -183,10 +221,10 @@ class Eagle3Attention(nn.Module):
         self.num_kv_groups = num_heads // num_kv_heads
 
         input_dim = hidden_size * 2
-        self.q_proj = nn.Linear(input_dim, num_heads * head_dim, bias=False)
-        self.k_proj = nn.Linear(input_dim, num_kv_heads * head_dim, bias=False)
-        self.v_proj = nn.Linear(input_dim, num_kv_heads * head_dim, bias=False)
-        self.o_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=False)
+        self.q_proj = nn.Linear(input_dim, num_heads * head_dim, bias=attention_bias)
+        self.k_proj = nn.Linear(input_dim, num_kv_heads * head_dim, bias=attention_bias)
+        self.v_proj = nn.Linear(input_dim, num_kv_heads * head_dim, bias=attention_bias)
+        self.o_proj = nn.Linear(num_heads * head_dim, hidden_size, bias=attention_bias)
 
         scaling_factor = 1.0
         original_max_pos = 4096
@@ -194,14 +232,21 @@ class Eagle3Attention(nn.Module):
         beta_slow = 1.0
         mscale = 1.0
         mscale_all_dim = 0.0
+        rope_type = "yarn"
+        low_freq_factor = 1.0
+        high_freq_factor = 4.0
 
         if rope_scaling is not None:
+            # HF uses "rope_type"; older internal configs use "type".  Accept both.
+            rope_type = rope_scaling.get("rope_type", rope_scaling.get("type", "yarn"))
             scaling_factor = rope_scaling.get("factor", 1.0)
             original_max_pos = rope_scaling.get("original_max_position_embeddings", 4096)
             beta_fast = rope_scaling.get("beta_fast", 32.0)
             beta_slow = rope_scaling.get("beta_slow", 1.0)
             mscale = rope_scaling.get("mscale", 1.0)
             mscale_all_dim = rope_scaling.get("mscale_all_dim", 0.0)
+            low_freq_factor = rope_scaling.get("low_freq_factor", 1.0)
+            high_freq_factor = rope_scaling.get("high_freq_factor", 4.0)
 
         self.rotary_emb = RotaryEmbedding(
             head_dim,
@@ -213,10 +258,14 @@ class Eagle3Attention(nn.Module):
             beta_slow=beta_slow,
             mscale=mscale,
             mscale_all_dim=mscale_all_dim,
+            rope_type=rope_type,
+            low_freq_factor=low_freq_factor,
+            high_freq_factor=high_freq_factor,
         )
 
+        # YaRN scales softmax by mscale²/sqrt(d).  llama3 / no-scaling use SDPA default.
         self._softmax_scale: Optional[float] = None
-        if rope_scaling is not None and scaling_factor > 1.0:
+        if rope_scaling is not None and scaling_factor > 1.0 and rope_type == "yarn":
             ms = _yarn_get_mscale(scaling_factor, mscale_all_dim)
             self._softmax_scale = (ms * ms) / math.sqrt(head_dim)
 
@@ -252,11 +301,16 @@ class Eagle3Attention(nn.Module):
 
 
 class Eagle3MLP(nn.Module):
-    def __init__(self, hidden_size: int, intermediate_size: int) -> None:
+    def __init__(
+        self,
+        hidden_size: int,
+        intermediate_size: int,
+        mlp_bias: bool = False,
+    ) -> None:
         super().__init__()
-        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=False)
-        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=False)
+        self.gate_proj = nn.Linear(hidden_size, intermediate_size, bias=mlp_bias)
+        self.up_proj = nn.Linear(hidden_size, intermediate_size, bias=mlp_bias)
+        self.down_proj = nn.Linear(intermediate_size, hidden_size, bias=mlp_bias)
 
     def forward(self, x: Tensor) -> Tensor:
         return self.down_proj(F.silu(self.gate_proj(x)) * self.up_proj(x))
@@ -273,10 +327,20 @@ class Eagle3DecoderLayer(nn.Module):
         rms_norm_eps: float = 1e-6,
         rope_theta: float = 1000000.0,
         rope_scaling: Optional[dict] = None,
+        use_input_layernorm: bool = True,
+        attention_bias: bool = False,
+        mlp_bias: bool = False,
     ) -> None:
         super().__init__()
         self.hidden_norm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        # If disabled, we still concat input_emb but without applying RMSNorm to it.
+        # This is used by some Eagle3 variants for the FIRST layer
+        # (use_input_layernorm_in_first_layer=False in eagle_config).
+        self.use_input_layernorm = use_input_layernorm
+        if use_input_layernorm:
+            self.input_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
+        else:
+            self.input_layernorm = nn.Identity()
         self.self_attn = Eagle3Attention(
             hidden_size=hidden_size,
             num_heads=num_heads,
@@ -284,9 +348,10 @@ class Eagle3DecoderLayer(nn.Module):
             head_dim=head_dim,
             rope_theta=rope_theta,
             rope_scaling=rope_scaling,
+            attention_bias=attention_bias,
         )
         self.post_attention_layernorm = RMSNorm(hidden_size, eps=rms_norm_eps)
-        self.mlp = Eagle3MLP(hidden_size, intermediate_size)
+        self.mlp = Eagle3MLP(hidden_size, intermediate_size, mlp_bias=mlp_bias)
 
     def forward(
         self,
@@ -333,15 +398,39 @@ class Eagle3Model(nn.Module):
         rope_theta: float = 1000000.0,
         num_kv_heads: Optional[int] = None,
         rope_scaling: Optional[dict] = None,
+        # ---- v2 knobs (HF eagle_config compatible) — defaults preserve kimi-k2.5 behavior ----
+        draft_vocab_size: Optional[int] = None,
+        use_aux_hidden_state: bool = True,
+        use_input_layernorm_in_first_layer: bool = True,
+        use_last_layernorm: bool = True,
+        use_mtp_layernorm: bool = False,
+        attention_bias: bool = False,
+        mlp_bias: bool = False,
+        num_aux_hidden_states: int = 3,
     ) -> None:
         super().__init__()
         self.hidden_dim = hidden_dim
         self.length = length
+        self.use_aux_hidden_state = use_aux_hidden_state
+        self.use_last_layernorm = use_last_layernorm
+        self.use_mtp_layernorm = use_mtp_layernorm
+        self.num_aux_hidden_states = num_aux_hidden_states
 
         num_kv_heads = num_kv_heads or num_heads
         ffn_dim = ffn_dim or hidden_dim * 4
 
-        self.fc = nn.Linear(hidden_dim * 3, hidden_dim, bias=False)
+        # fc projects concatenated aux teacher hidden states down to hidden_dim.
+        # When use_aux_hidden_state=False we still build fc for state-dict
+        # compatibility but skip it in forward (h = token_embeds instead).
+        fc_in = hidden_dim * num_aux_hidden_states
+        self.fc = nn.Linear(fc_in, hidden_dim, bias=False)
+
+        # MTP-style normalization applied to aux hidden states before fc.
+        # nvidia/gpt-oss-120b-Eagle3 sets this to False; some MTP variants set True.
+        if use_mtp_layernorm:
+            self.mtp_norm = RMSNorm(fc_in, eps=rms_norm_eps)
+        else:
+            self.mtp_norm = None
 
         self.layers = nn.ModuleList([
             Eagle3DecoderLayer(
@@ -353,12 +442,70 @@ class Eagle3Model(nn.Module):
                 rms_norm_eps=rms_norm_eps,
                 rope_theta=rope_theta,
                 rope_scaling=rope_scaling,
+                use_input_layernorm=(
+                    use_input_layernorm_in_first_layer if i == 0 else True
+                ),
+                attention_bias=attention_bias,
+                mlp_bias=mlp_bias,
             )
-            for _ in range(num_layers)
+            for i in range(num_layers)
         ])
 
-        self.out_norm = RMSNorm(hidden_dim, eps=rms_norm_eps)
-        self.lm_head = nn.Linear(hidden_dim, vocab_size, bias=False)
+        if use_last_layernorm:
+            self.out_norm = RMSNorm(hidden_dim, eps=rms_norm_eps)
+        else:
+            self.out_norm = None
+
+        lm_head_vocab = draft_vocab_size if draft_vocab_size else vocab_size
+        self.lm_head = nn.Linear(hidden_dim, lm_head_vocab, bias=False)
+        self.draft_vocab_size = lm_head_vocab
+
+    @classmethod
+    def from_hf_config(
+        cls,
+        config: dict,
+        length: int = 5,
+        teacher_hidden_size: Optional[int] = None,
+    ) -> "Eagle3Model":
+        """Instantiate Eagle3Model from an HF-style config.json dict.
+
+        Supports both legacy (kimi-k2.5 YaRN) and new (nvidia gpt-oss-120b
+        Llama3 + ``eagle_config``) layouts.  ``teacher_hidden_size`` overrides
+        the draft ``hidden_size`` when the draft fc must match a different
+        teacher dimension — pass it if the teacher model has a different
+        hidden_size than the Eagle3 config records.
+        """
+        eagle_cfg = config.get("eagle_config", {}) or {}
+
+        hidden_dim = int(config["hidden_size"])
+        if teacher_hidden_size is not None:
+            hidden_dim = int(teacher_hidden_size)
+
+        num_aux = len(eagle_cfg.get("eagle_aux_hidden_state_layer_ids", [])) or 3
+
+        return cls(
+            hidden_dim=hidden_dim,
+            vocab_size=int(config["vocab_size"]),
+            num_heads=int(config["num_attention_heads"]),
+            num_layers=int(config.get("num_hidden_layers", 1)),
+            length=length,
+            ffn_dim=int(config["intermediate_size"]),
+            head_dim=int(config.get("head_dim", hidden_dim // int(config["num_attention_heads"]))),
+            rms_norm_eps=float(config.get("rms_norm_eps", 1e-6)),
+            rope_theta=float(config.get("rope_theta", 1000000.0)),
+            num_kv_heads=int(config.get("num_key_value_heads", config["num_attention_heads"])),
+            rope_scaling=config.get("rope_scaling"),
+            draft_vocab_size=config.get("draft_vocab_size"),
+            use_aux_hidden_state=bool(eagle_cfg.get("use_aux_hidden_state", True)),
+            use_input_layernorm_in_first_layer=bool(
+                eagle_cfg.get("use_input_layernorm_in_first_layer", True)
+            ),
+            use_last_layernorm=bool(eagle_cfg.get("use_last_layernorm", True)),
+            use_mtp_layernorm=bool(eagle_cfg.get("use_mtp_layernorm", False)),
+            attention_bias=bool(config.get("attention_bias", False)),
+            mlp_bias=bool(config.get("mlp_bias", False)),
+            num_aux_hidden_states=num_aux,
+        )
 
     def forward(
         self,
@@ -398,7 +545,12 @@ class Eagle3Model(nn.Module):
         if target_hidden_states is not None:
             target_hidden_states = F.pad(target_hidden_states, (0, 0, 0, self.length), value=0.0)
 
-        h = self.fc(aux_hidden_states)
+        if self.use_aux_hidden_state:
+            fc_in = self.mtp_norm(aux_hidden_states) if self.mtp_norm is not None else aux_hidden_states
+            h = self.fc(fc_in)
+        else:
+            # No teacher fusion: start from token embeddings directly.
+            h = token_embeds
 
         current_ids = target_ids
         current_mask = loss_mask
@@ -407,7 +559,7 @@ class Eagle3Model(nn.Module):
             for layer in self.layers:
                 h = layer(input_emb=token_embeds, hidden_states=h, position_ids=position_ids)
 
-            normed = self.out_norm(h)
+            normed = self.out_norm(h) if self.out_norm is not None else h
 
             if current_mask is not None:
                 hs_flat = normed.reshape(-1, D)

@@ -177,10 +177,14 @@ class SpecDistillTrainer:
                     "type": rope_scaling_type,
                     "factor": getattr(draft_cfg, "rope_scaling_factor", 64.0),
                     "original_max_position_embeddings": getattr(draft_cfg, "rope_original_max_pos", 4096),
+                    # YaRN params (ignored by Llama3 branch)
                     "beta_fast": getattr(draft_cfg, "rope_beta_fast", 32.0),
                     "beta_slow": getattr(draft_cfg, "rope_beta_slow", 1.0),
                     "mscale": getattr(draft_cfg, "rope_mscale", 1.0),
                     "mscale_all_dim": getattr(draft_cfg, "rope_mscale_all_dim", 1.0),
+                    # Llama3 params (ignored by YaRN branch)
+                    "low_freq_factor": getattr(draft_cfg, "rope_low_freq_factor", 1.0),
+                    "high_freq_factor": getattr(draft_cfg, "rope_high_freq_factor", 4.0),
                 }
 
             teacher_vocab_size = self._lm_head_weight.shape[0]
@@ -196,6 +200,17 @@ class SpecDistillTrainer:
                 rope_theta=rope_theta,
                 num_kv_heads=num_kv_heads,
                 rope_scaling=rope_scaling,
+                # HF eagle_config knobs — passed through unconditionally; defaults
+                # in DraftModelConfig already match the kimi-k2.5 baseline so
+                # existing configs are unaffected.
+                use_aux_hidden_state=getattr(draft_cfg, "use_aux_hidden_state", True),
+                use_input_layernorm_in_first_layer=getattr(
+                    draft_cfg, "use_input_layernorm_in_first_layer", True
+                ),
+                use_last_layernorm=getattr(draft_cfg, "use_last_layernorm", True),
+                use_mtp_layernorm=getattr(draft_cfg, "use_mtp_layernorm", False),
+                attention_bias=getattr(draft_cfg, "attention_bias", False),
+                mlp_bias=getattr(draft_cfg, "mlp_bias", False),
             )
         elif draft_type == "dflash":
             from lumenrl.models.dflash import DFlashModel
@@ -628,6 +643,12 @@ class SpecDistillTrainer:
             self._dataset = None
             return
 
+        # HF hub datasets (and saved local-dir datasets) may not use "train"
+        # as their split name (e.g. ultrachat_200k uses train_sft).  Local
+        # file-based loaders (parquet/json) always create a synthetic "train"
+        # split regardless, so they keep the hardcoded name.
+        hf_split = getattr(self.config.reward, "dataset_split", "train") or "train"
+
         from datasets import load_dataset
 
         if os.path.isfile(dataset_path) or os.path.isdir(dataset_path):
@@ -640,9 +661,9 @@ class SpecDistillTrainer:
                     "json", data_files=dataset_path, split="train"
                 )
             else:
-                self._dataset = load_dataset(dataset_path, split="train")
+                self._dataset = load_dataset(dataset_path, split=hf_split)
         else:
-            self._dataset = load_dataset(dataset_path, split="train")
+            self._dataset = load_dataset(dataset_path, split=hf_split)
 
         self._dataset = self._dataset.shuffle(seed=self.config.seed)
         logger.info(

@@ -802,35 +802,57 @@ class VllmTeacherEngine:
         master forever. Signal the whole process group instead.
         """
         proc = self._proc
-        if proc is not None and proc.poll() is None:
-            # Best-effort graceful shutdown — fire-and-forget so we never
-            # block on a wedged worker's response.
-            cmd_f = self._cmd_f
-            if cmd_f is not None:
-                try:
-                    cmd_f.write(json.dumps({"cmd": "shutdown"}) + "\n")
-                    cmd_f.flush()
-                except Exception:
-                    pass
-
+        if proc is not None:
+            # Capture pgid up-front: even if the wrapper exits cleanly, vLLM's
+            # multiproc_executor grandchildren (EngineCore / Worker_TP*) stay
+            # alive in the same process group with the wrapper's pid as pgid.
+            # Linux keeps a pgid valid as long as any member exists.
+            pgid = None
             try:
-                proc.wait(timeout=3)
-            except subprocess.TimeoutExpired:
+                pgid = os.getpgid(proc.pid)
+            except (ProcessLookupError, PermissionError):
                 pass
 
             if proc.poll() is None:
-                self._killpg(proc.pid, signal.SIGTERM)
-                try:
-                    proc.wait(timeout=5)
-                except subprocess.TimeoutExpired:
-                    self._killpg(proc.pid, signal.SIGKILL)
+                # Best-effort graceful shutdown — fire-and-forget so we never
+                # block on a wedged worker's response.
+                cmd_f = self._cmd_f
+                if cmd_f is not None:
                     try:
-                        proc.wait(timeout=5)
-                    except subprocess.TimeoutExpired:
+                        cmd_f.write(json.dumps({"cmd": "shutdown"}) + "\n")
+                        cmd_f.flush()
+                    except Exception:
+                        pass
+                try:
+                    proc.wait(timeout=3)
+                except subprocess.TimeoutExpired:
+                    pass
+
+            # Always nuke the whole process group, even if `proc` itself
+            # already exited.  The wrapper exits as soon as it forwards the
+            # shutdown signal, but its multiproc_executor grandchildren can
+            # hang in mooncake C++ destructors and survive as orphans.
+            if pgid is not None:
+                self._killpg_by_pgid(pgid, signal.SIGTERM)
+                deadline = time.monotonic() + 5.0
+                while time.monotonic() < deadline:
+                    if not self._pgid_has_members(pgid):
+                        break
+                    time.sleep(0.2)
+
+                if self._pgid_has_members(pgid):
+                    self._killpg_by_pgid(pgid, signal.SIGKILL)
+                    deadline = time.monotonic() + 5.0
+                    while time.monotonic() < deadline:
+                        if not self._pgid_has_members(pgid):
+                            break
+                        time.sleep(0.2)
+
+                    if self._pgid_has_members(pgid):
                         logger.warning(
-                            "vLLM teacher subprocess pid=%d did not exit "
-                            "after SIGKILL; orphan workers may remain.",
-                            proc.pid,
+                            "vLLM teacher pgid=%d still has members after "
+                            "SIGKILL; orphan workers may remain.",
+                            pgid,
                         )
 
         if self._mooncake_store is not None:
@@ -866,10 +888,43 @@ class VllmTeacherEngine:
         except (ProcessLookupError, PermissionError):
             pass
 
+    @staticmethod
+    def _killpg_by_pgid(pgid: int, sig: int) -> None:
+        try:
+            os.killpg(pgid, sig)
+        except (ProcessLookupError, PermissionError):
+            pass
+
+    @staticmethod
+    def _pgid_has_members(pgid: int) -> bool:
+        """Return True if any process is still in the given process group."""
+        try:
+            for entry in os.listdir("/proc"):
+                if not entry.isdigit():
+                    continue
+                try:
+                    if os.getpgid(int(entry)) == pgid:
+                        return True
+                except (ProcessLookupError, PermissionError):
+                    continue
+        except OSError:
+            # /proc missing — fall back to signal-0 probe on the pgid itself.
+            try:
+                os.killpg(pgid, 0)
+                return True
+            except (ProcessLookupError, PermissionError):
+                return False
+        return False
+
     def __del__(self) -> None:
         proc = getattr(self, "_proc", None)
-        if proc is not None and proc.poll() is None:
-            self._killpg(proc.pid, signal.SIGKILL)
+        if proc is None:
+            return
+        try:
+            pgid = os.getpgid(proc.pid)
+        except (ProcessLookupError, PermissionError):
+            return
+        self._killpg_by_pgid(pgid, signal.SIGKILL)
 
 
 __all__ = ["VllmTeacherEngine"]

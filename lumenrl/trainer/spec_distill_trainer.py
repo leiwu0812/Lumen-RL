@@ -404,12 +404,15 @@ class SpecDistillTrainer:
             if rope_scaling_type:
                 rope_scaling = {
                     "type": rope_scaling_type,
+                    "rope_type": rope_scaling_type,
                     "factor": getattr(draft_cfg, "rope_scaling_factor", 64.0),
                     "original_max_position_embeddings": getattr(draft_cfg, "rope_original_max_pos", 4096),
                     "beta_fast": getattr(draft_cfg, "rope_beta_fast", 32.0),
                     "beta_slow": getattr(draft_cfg, "rope_beta_slow", 1.0),
                     "mscale": getattr(draft_cfg, "rope_mscale", 1.0),
                     "mscale_all_dim": getattr(draft_cfg, "rope_mscale_all_dim", 1.0),
+                    "low_freq_factor": getattr(draft_cfg, "rope_low_freq_factor", 1.0),
+                    "high_freq_factor": getattr(draft_cfg, "rope_high_freq_factor", 4.0),
                 }
 
             teacher_vocab_size = self._lm_head_weight.shape[0]
@@ -947,20 +950,21 @@ class SpecDistillTrainer:
             return
 
         from datasets import load_dataset
+        dataset_split = getattr(self.config.reward, "dataset_split", "train")
 
         if os.path.isfile(dataset_path) or os.path.isdir(dataset_path):
             if dataset_path.endswith(".parquet"):
                 self._dataset = load_dataset(
-                    "parquet", data_files=dataset_path, split="train"
+                    "parquet", data_files=dataset_path, split=dataset_split
                 )
             elif dataset_path.endswith((".jsonl", ".json")):
                 self._dataset = load_dataset(
-                    "json", data_files=dataset_path, split="train"
+                    "json", data_files=dataset_path, split=dataset_split
                 )
             else:
-                self._dataset = load_dataset(dataset_path, split="train")
+                self._dataset = load_dataset(dataset_path, split=dataset_split)
         else:
-            self._dataset = load_dataset(dataset_path, split="train")
+            self._dataset = load_dataset(dataset_path, split=dataset_split)
 
         self._dataset = self._dataset.shuffle(seed=self.config.seed)
         logger.info(

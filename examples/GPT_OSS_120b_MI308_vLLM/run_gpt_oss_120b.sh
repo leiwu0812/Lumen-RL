@@ -12,18 +12,25 @@
 #   GPUs 4-7: vLLM teacher inference (TP=4, native MXFP4 MoE)
 #
 # Usage:
-#   bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh
-#   bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh --smoke-test
+#   bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh                  # phase 1 (ultrachat)
+#   bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh --phase2          # phase 2 (Magpie, resumes phase 1)
+#   bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh --smoke-test      # 5-step synthetic-prompt pipeline test
 #   MODEL_PATH=/path/to/model bash examples/GPT_OSS_120b_MI308_vLLM/run_gpt_oss_120b.sh
 # ═══════════════════════════════════════════════════════════════════════════════
 set -uo pipefail
 
 SMOKE_TEST=false
+PHASE2=false
 for arg in "$@"; do
     case "${arg}" in
         --smoke-test) SMOKE_TEST=true ;;
+        --phase2)     PHASE2=true ;;
     esac
 done
+if [ "${SMOKE_TEST}" = true ] && [ "${PHASE2}" = true ]; then
+    echo "ERROR: --smoke-test and --phase2 are mutually exclusive" >&2
+    exit 2
+fi
 
 SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
@@ -31,7 +38,6 @@ REPO_ROOT="$(cd "${SCRIPT_DIR}/../.." && pwd)"
 EXP_NAME="gpt-oss-120b-eagle3-vllm-mi308"
 OUTPUT_DIR="${REPO_ROOT}/output/GPT_OSS_120b_SDDD/LumenRL"
 LOG_FILE="${OUTPUT_DIR}/${EXP_NAME}.log"
-LOG_FILE_FULL="${OUTPUT_DIR}/${EXP_NAME}.full.log"
 
 # Patterns dropped from the main log (still kept in *.full.log).
 # Mooncake's mooncake-store master client / transfer engine print thousands of
@@ -47,6 +53,8 @@ NUM_TRAIN_GPUS="${NUM_TRAIN_GPUS:-4}"
 MODEL_PATH="${MODEL_PATH:-/dev/shm/gpt-oss-120b}"
 if [ "${SMOKE_TEST}" = true ]; then
     CKPT_DIR="${CKPT_DIR:-/dev/shm/checkpoints/gpt_oss_120b_smoke_test_vllm}"
+elif [ "${PHASE2}" = true ]; then
+    CKPT_DIR="${CKPT_DIR:-/dev/shm/checkpoints/gpt_oss_120b_eagle3_vllm_phase2}"
 else
     CKPT_DIR="${CKPT_DIR:-/dev/shm/checkpoints/gpt_oss_120b_eagle3_vllm}"
 fi
@@ -55,8 +63,11 @@ fi
 if [ "${SMOKE_TEST}" = true ]; then
     CONFIG="${SCRIPT_DIR}/configs/smoke_test.yaml"
     echo ">>> SMOKE TEST: 5-step Eagle3 validation (vLLM+Mooncake TCP, gpt-oss-120b)"
+elif [ "${PHASE2}" = true ]; then
+    CONFIG="${SCRIPT_DIR}/configs/phase2_magpie.yaml"
+    echo ">>> PHASE 2: Magpie-Llama-3.1-Pro-300K-Filtered, resumes from phase 1 ckpt"
 else
-    CONFIG="${SCRIPT_DIR}/configs/opd_gpt_oss_120b.yaml"
+    CONFIG="${SCRIPT_DIR}/configs/phase1_ultrachat.yaml"
 fi
 
 # Environment
@@ -100,25 +111,34 @@ OVERRIDES=(
     "checkpointing.checkpoint_dir=${CKPT_DIR}"
 )
 
-# Launch training on GPUs 0-3 (VllmTeacherEngine subprocess manages GPUs 4-7 internally)
-# Logging strategy: full firehose goes to *.full.log; the main *.log (and stdout)
-# drops Mooncake's INFO/VLOG noise so real training events stay visible.
+# Launch training on GPUs 0-3 (VllmTeacherEngine subprocess manages GPUs 4-7 internally).
+# Logging: single tee pipeline (Kimi style). One file, with mooncake's glog
+# spam filtered out — same regex set Kimi uses plus our explicit noise list.
 CUDA_VISIBLE_DEVICES="${TRAIN_GPUS}" \
     torchrun --nproc_per_node="${NUM_TRAIN_GPUS}" \
         -m lumenrl.trainer.main \
         --config "${CONFIG}" \
         ${OVERRIDES[@]+"${OVERRIDES[@]}"} \
         2>&1 \
-    | tee "${LOG_FILE_FULL}" \
+    | grep --line-buffered -v -E "^[IWEF][0-9]{4} [0-9:.]+\s+[0-9]+ \S+\.(cpp|cc|h):" \
     | grep --line-buffered -vE "${MOONCAKE_NOISE_RE}" \
     | tee "${LOG_FILE}"
-
 EXIT_CODE=${PIPESTATUS[0]}
+
+# torchrun may swallow child SIGABRT/SIGSEGV and return 0. Mirror Kimi's
+# extra log scan so a Python traceback or torchrun "exitcode: -N" reliably
+# fails the wrapper.
+if [ ${EXIT_CODE} -eq 0 ] && grep -qE \
+    '(Traceback \(most recent call last\)|HfHubHTTPError|Training failed|FAILED|exitcode\s*:\s*-[0-9]+|MEMORY_APERTURE_VIOLATION|out of memory)' \
+    "${LOG_FILE}" 2>/dev/null; then
+    echo ">>> Crash detected in log despite torchrun exit code 0." >&2
+    EXIT_CODE=1
+fi
+
 if [ ${EXIT_CODE} -eq 0 ]; then
     echo ">>> GPT-OSS-120B Eagle3 distillation (vLLM, MI308) completed successfully."
 else
     echo ">>> GPT-OSS-120B Eagle3 distillation (vLLM, MI308) failed with exit code ${EXIT_CODE}." >&2
 fi
-echo ">>> Clean log: ${LOG_FILE}"
-echo ">>> Full  log: ${LOG_FILE_FULL}"
+echo ">>> Log: ${LOG_FILE}"
 exit ${EXIT_CODE}

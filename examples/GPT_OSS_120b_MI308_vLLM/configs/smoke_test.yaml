@@ -34,7 +34,7 @@ algorithm:
     position_decay: 0.8
     num_target_layers: 1
     spec_length: 4
-    # Same teacher-layer indices as opd_gpt_oss_120b.yaml so smoke test
+    # Same teacher-layer indices as phase1_ultrachat.yaml so smoke test
     # exercises the production data path.
     aux_hidden_state_layer_ids: [1, 17, 32]
   teacher:
@@ -46,7 +46,7 @@ algorithm:
   draft:
     from_scratch: true
     # ---- Aligned with nvidia/gpt-oss-120b-Eagle3-long-context/config.json ----
-    # Mirrors examples/.../configs/opd_gpt_oss_120b.yaml so the smoke test
+    # Mirrors examples/.../configs/phase1_ultrachat.yaml so the smoke test
     # builds the SAME draft architecture as the production run.
     num_layers: 1                  # num_hidden_layers
     num_heads: 64                  # num_attention_heads
@@ -96,5 +96,5 @@ logger:
   wandb_enabled: false
   log_interval: 1
 
-num_training_steps: 2
+num_training_steps: 5
 seed: 42

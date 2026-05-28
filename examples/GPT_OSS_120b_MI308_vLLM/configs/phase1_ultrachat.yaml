@@ -26,8 +26,15 @@ policy:
   model_name: /dev/shm/gpt-oss-120b
   training_backend: fsdp2
   generation_backend: hf
-  max_total_sequence_length: 20000
-  train_global_batch_size: 8
+  # NVIDIA recipe trains at 8192 ctx; YaRN factor 8 still gives 131K inference.
+  # 20K wastes mooncake host buffer + draft activations for no benefit and
+  # bloats the first-step torch.compile.
+  max_total_sequence_length: 8192
+  # Global=32 over 4 ranks with micro=1 → num_accum=8, every rank gets 8 mb.
+  # The previous (B=8, micro=auto) collapsed to num_accum=1 so only rank 0
+  # did real work (see spec_distill_trainer.py:1791 round-robin slicing).
+  train_global_batch_size: 32
+  train_micro_batch_size: 1
   learning_rate: 5e-5
   weight_decay: 0.0
   max_grad_norm: 0.5
@@ -88,15 +95,29 @@ quantization:
   rollout_correction:
     enabled: false
 
+# SDDD doesn't use rewards; the `reward` block carries the dataset pointer
+# only because the trainer reads `reward.dataset` / `reward.dataset_split` as
+# its prompt source. `type` / `function` are inert here.
+#
+# NVIDIA recipe trains on ultrachat_200k + Magpie-Llama-3.1-Pro-300K-Filtered
+# using ONLY prompts (responses synthesised by the teacher at training time).
+# spec_distill_trainer's loader already ignores the `messages` field on
+# ultrachat samples and reads only `s["prompt"]` (see
+# spec_distill_trainer.py:1089), so train_sft is effectively prompt-only here.
+# Adding Magpie would require multi-dataset concat support in _load_dataset.
 reward:
   type: function
   function: math_reward
   dataset: HuggingFaceH4/ultrachat_200k
-  dataset_split: train_sft        # ultrachat_200k uses train_sft / test_sft / train_gen / test_gen — no plain "train"
+  dataset_split: train_sft
 
 checkpointing:
-  checkpoint_dir: results/gpt_oss_120b_spec_distill_vllm
-  save_steps: 50000
+  checkpoint_dir: /dev/shm/checkpoints/gpt_oss_120b_eagle3_vllm
+  # 19488 steps / 100 = ~195 saves, capped to last 3 by save_total_limit (~9 GB).
+  # MI308 ROCm hits HSA aperture faults on long runs (~once per 500-700 steps
+  # with vLLM+aiter teacher); auto-restart wrapper resumes from the latest
+  # ckpt — so per-crash redo cost ≈ 0-100 steps.
+  save_steps: 100
   save_total_limit: 3
   resume: true
 
@@ -104,5 +125,9 @@ logger:
   wandb_enabled: false
   log_interval: 1
 
-num_training_steps: 5
+# ultrachat_200k train_sft = 207,865 effective samples (1 empty prompt dropped).
+# With global_bs=32: 1 epoch = ceil(207865/32) = 6,496 steps; 3 epochs = 19,488.
+# NVIDIA recipe is 3 epochs over ~503K prompts (ultrachat + Magpie); we use
+# ultrachat only, so this is the equivalent epoch budget on the smaller set.
+num_training_steps: 19488
 seed: 42

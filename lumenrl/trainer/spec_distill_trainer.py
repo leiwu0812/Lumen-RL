@@ -966,6 +966,33 @@ class SpecDistillTrainer:
         else:
             self._dataset = load_dataset(dataset_path, split=dataset_split)
 
+        def _has_nonempty_prompt(s: dict) -> bool:
+            convs = s.get("conversations")
+            if convs and isinstance(convs, list) and isinstance(convs[0], dict):
+                return any(
+                    isinstance(m, dict)
+                    and str(m.get("content") or m.get("value") or "").strip()
+                    for m in convs
+                )
+            for key in ("prompt", "question", "input", "problem"):
+                raw = s.get(key)
+                if isinstance(raw, str) and raw.strip():
+                    return True
+                if isinstance(raw, list) and any(
+                    isinstance(m, dict) and str(m.get("content") or "").strip()
+                    for m in raw
+                ):
+                    return True
+            return False
+
+        n_before = len(self._dataset)
+        self._dataset = self._dataset.filter(_has_nonempty_prompt)
+        n_after = len(self._dataset)
+        if n_after < n_before:
+            logger.warning(
+                "Dropped %d/%d samples with empty prompt", n_before - n_after, n_before
+            )
+
         self._dataset = self._dataset.shuffle(seed=self.config.seed)
         logger.info(
             "Loaded dataset: %d samples (shuffled, seed=%d) from %s",

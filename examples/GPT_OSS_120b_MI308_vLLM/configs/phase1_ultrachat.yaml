@@ -129,5 +129,5 @@ logger:
 # With global_bs=32: 1 epoch = ceil(207865/32) = 6,496 steps; 3 epochs = 19,488.
 # NVIDIA recipe is 3 epochs over ~503K prompts (ultrachat + Magpie); we use
 # ultrachat only, so this is the equivalent epoch budget on the smaller set.
-num_training_steps: 19488
+num_training_steps: 19488 
 seed: 42

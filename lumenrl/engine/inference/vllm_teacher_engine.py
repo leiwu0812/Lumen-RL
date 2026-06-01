@@ -75,6 +75,8 @@ tp_size = int(sys.argv[4])
 gpu_ids_str = sys.argv[5]
 quantization = sys.argv[6] if len(sys.argv) > 6 else ""
 max_seq_len = int(sys.argv[7]) if len(sys.argv) > 7 else 8192
+# argv[8]: JSON-encoded aux_layer_ids override (empty string => use auto).
+aux_layer_ids_override_json = sys.argv[8] if len(sys.argv) > 8 else ""
 
 gpu_ids = [int(x) for x in gpu_ids_str.split(",")]
 os.environ["CUDA_VISIBLE_DEVICES"] = gpu_ids_str
@@ -99,11 +101,20 @@ hidden_size = getattr(hf_config_text, "hidden_size", None)
 num_layers = getattr(hf_config_text, "num_hidden_layers", 32)
 
 # Aux layer IDs in vLLM convention (capture-before-layer).
-# vLLM captures input to [2, N//2, N-3] which yields the same hidden state
+# Default vLLM auto-pick: [2, N//2, N-3] — yields the same hidden state
 # as hooking layer output at [1, N//2-1, N-4].
-aux_layer_ids = [2, num_layers // 2, num_layers - 3]
-logger.info("Model: %s, hidden=%d, layers=%d, aux_layers=%s",
-            model_path, hidden_size, num_layers, aux_layer_ids)
+# Config override wins when provided (e.g. NVIDIA gpt-oss-120b-Eagle3 uses
+# [1, 17, 32]). The override is the literal list the draft model was built
+# for; we pass it through unchanged so the captured features line up with
+# the draft architecture.
+if aux_layer_ids_override_json:
+    aux_layer_ids = json.loads(aux_layer_ids_override_json)
+    logger.info("Model: %s, hidden=%d, layers=%d, aux_layers=%s (config override)",
+                model_path, hidden_size, num_layers, aux_layer_ids)
+else:
+    aux_layer_ids = [2, num_layers // 2, num_layers - 3]
+    logger.info("Model: %s, hidden=%d, layers=%d, aux_layers=%s (auto)",
+                model_path, hidden_size, num_layers, aux_layer_ids)
 
 # Create vLLM Engine with extract_hidden_states + MooncakeHiddenStatesConnector
 logger.info("Creating vLLM Engine (tp=%d, quant=%s, max_seq=%d)",
@@ -299,6 +310,7 @@ class VllmTeacherEngine:
         max_batch_size: int = 32,
         max_seq_len: int = 4096,
         local_device: Optional[torch.device] = None,
+        aux_layer_ids: Optional[list[int]] = None,
     ):
         self._model_name = model_name
         self._gpu_ids = gpu_ids
@@ -307,6 +319,10 @@ class VllmTeacherEngine:
         self._quantization = quantization
         self._max_batch_size = max_batch_size
         self._max_seq_len = max_seq_len
+        # When None, the worker auto-picks [2, N//2, N-3]. Otherwise this list
+        # is the literal eagle_aux_hidden_state_layer_ids passed to vLLM ──
+        # must match what the draft model was constructed for.
+        self._aux_layer_ids_override = aux_layer_ids
         self._local_device = local_device or torch.device("cuda:0")
 
         self._proc: Optional[subprocess.Popen] = None
@@ -425,6 +441,10 @@ class VllmTeacherEngine:
             self._quantization or "none",
         )
 
+        aux_override_arg = (
+            json.dumps(list(self._aux_layer_ids_override))
+            if self._aux_layer_ids_override else ""
+        )
         self._proc = subprocess.Popen(
             [
                 sys.executable, "-u", "-c", _WORKER_SCRIPT,
@@ -433,6 +453,7 @@ class VllmTeacherEngine:
                 ",".join(str(g) for g in self._gpu_ids),
                 self._quantization or "",
                 str(self._max_seq_len),
+                aux_override_arg,
             ],
             stdin=subprocess.DEVNULL,
             stdout=None,
